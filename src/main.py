@@ -1,10 +1,15 @@
 import argparse
 import getpass
+import gzip
+import io
+import os
 import shlex
 import socket
 import sys
+import tarfile
 import tkinter as tk
-
+import urllib.error
+import urllib.request
 
 
 class Parser(argparse.ArgumentParser):
@@ -25,7 +30,9 @@ def build_parser():
     p.add_argument("--package", required=True,
                    help="имя анализируемого пакета")
     p.add_argument("--repo", default="",
-                   help="URL репозитория или путь к файлу тестового репозитория")
+                   help="URL репозитория (например "
+                        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64) "
+                        "или путь к файлу тестового репозитория")
     p.add_argument("--test-mode", action="store_true",
                    help="режим работы с тестовым репозиторием")
     p.add_argument("--output", default="graph.png",
@@ -45,6 +52,77 @@ config = {}
 
 def format_config(cfg):
     return "\n".join(f"{key}: {value}" for key, value in cfg.items())
+
+
+
+def load_apkindex_text(repo, test_mode):
+    if not repo:
+        raise ValueError("не задан --repo")
+
+    if test_mode or os.path.exists(repo):
+        if not os.path.isfile(repo):
+            raise ValueError(f"файл тестового репозитория не найден: {repo}")
+        with open(repo, "rb") as f:
+            data = f.read()
+    else:
+        if not repo.startswith(("http://", "https://")):
+            raise ValueError("--repo должен быть URL (http/https) "
+                             "или путём к файлу в тестовом режиме")
+        url = repo.rstrip("/")
+        if not url.endswith("APKINDEX.tar.gz"):
+            url += "/APKINDEX.tar.gz"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            raise ValueError(f"HTTP {e.code} при загрузке {url}")
+        except urllib.error.URLError as e:
+            raise ValueError(f"не удалось загрузить {url}: {e.reason}")
+
+    if data[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(data)
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
+                member = next((m for m in tar.getmembers()
+                               if m.name == "APKINDEX"), None)
+                if member is None:
+                    raise ValueError("в архиве нет файла APKINDEX")
+                data = tar.extractfile(member).read()
+        except (OSError, tarfile.TarError, EOFError) as e:
+            raise ValueError(f"не удалось распаковать APKINDEX: {e}")
+
+    return data.decode("utf-8", errors="replace")
+
+
+def parse_apkindex(text):
+    packages = []
+    for block in text.split("\n\n"):
+        entry = {}
+        for line in block.splitlines():
+            if len(line) > 2 and line[1] == ":":
+                entry[line[0]] = line[2:]
+        if "P" in entry:
+            packages.append(entry)
+    return packages
+
+
+def find_package(packages, name):
+    for pkg in packages:
+        if pkg["P"] == name:
+            return pkg
+    for pkg in packages:
+        for provided in pkg.get("p", "").split():
+            if provided.split("=")[0] == name:
+                return pkg
+    return None
+
+
+def get_direct_dependencies(package, repo, test_mode):
+    packages = parse_apkindex(load_apkindex_text(repo, test_mode))
+    pkg = find_package(packages, package)
+    if pkg is None:
+        raise ValueError(f"пакет '{package}' не найден в репозитории")
+    return pkg, pkg.get("D", "").split()
 
 
 
@@ -92,6 +170,27 @@ def handle(args):
     write(text)
 
 
+    write("")
+    write("Загрузка данных репозитория...")
+    window.update_idletasks()
+    try:
+        pkg, deps = get_direct_dependencies(
+            config["package"], config["repo"], config["test_mode"])
+    except ValueError as e:
+        write(f"Ошибка: {e}")
+        return
+
+    header = f"Прямые зависимости пакета {pkg['P']} {pkg.get('V', '')}:"
+    lines = [header]
+    if deps:
+        lines += [f"  {i}. {d}" for i, d in enumerate(deps, 1)]
+    else:
+        lines.append("  (нет зависимостей)")
+    out = "\n".join(lines)
+    print(out)
+    write(out)
+
+
 def on_enter(event):
     line = console.get("input_start", "end-1c")
     console.insert("end", "\n")
@@ -132,7 +231,8 @@ console.bind("<Home>", on_home)
 if len(sys.argv) > 1:
     handle(sys.argv[1:])
 else:
-    write("Введите опции, например: --package requests --max-depth 5")
+    write("Введите опции, например: --package busybox "
+          "--repo https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64")
     write("help — список опций, exit — выход")
 show_prompt()
 window.mainloop()
