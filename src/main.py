@@ -1,5 +1,7 @@
 import argparse
 import getpass
+import os
+import subprocess
 import gzip
 import io
 import re
@@ -242,6 +244,48 @@ def ascii_tree(root, graph):
                       path + (node,))
     return lines
 
+def dot_quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def to_dot(root, order, graph, cycles):
+    cycle_edges = set()
+    for c in cycles:
+        cycle_edges.update(zip(c, c[1:]))
+
+    lines = [f"digraph {dot_quote(root)} {{",
+             "  rankdir=LR;",
+             '  node [shape=box, fontname="Arial"];',
+             f"  {dot_quote(root)} [style=filled, fillcolor=lightblue];"]
+    for node in order:
+        if node != root and node not in graph:
+            lines.append(f"  {dot_quote(node)} [style=dashed];")
+    for node, deps in graph.items():
+        for dep in deps:
+            attr = " [color=red]" if (node, dep) in cycle_edges else ""
+            lines.append(f"  {dot_quote(node)} -> {dot_quote(dep)}{attr};")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def save_graph(dot_text, output):
+    folder = os.path.dirname(output)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    dot_path = os.path.splitext(output)[0] + ".dot"
+    with open(dot_path, "w", encoding="utf-8") as f:
+        f.write(dot_text)
+    try:
+        subprocess.run(["dot", "-Tpng", "-o", output],
+                       input=dot_text.encode("utf-8"),
+                       check=True, capture_output=True)
+    except FileNotFoundError:
+        return (f"Graphviz не найден в PATH: PNG не создан, "
+                f"описание графа сохранено в {dot_path}")
+    except subprocess.CalledProcessError as e:
+        return f"Ошибка dot: {e.stderr.decode('utf-8', errors='replace')}"
+    return f"Изображение графа сохранено: {output} (описание: {dot_path})"
+
 def load_order(root, graph):
     result = []
     visited = {root}
@@ -305,6 +349,12 @@ def analyze(cfg):
         out.append("")
         out.append("ASCII-дерево:")
         out += ascii_tree(package, graph)
+        dot_text = to_dot(package, order, graph, cycles)
+        out.append("")
+        out.append("Описание графа (Graphviz):")
+        out.append(dot_text)
+        out.append("")
+        out.append(save_graph(dot_text, cfg["output"]))
     return "\n".join(out)
 
 
