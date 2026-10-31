@@ -2,7 +2,7 @@ import argparse
 import getpass
 import gzip
 import io
-import os
+import re
 import shlex
 import socket
 import sys
@@ -32,7 +32,7 @@ def build_parser():
     p.add_argument("--repo", default="",
                    help="URL репозитория (например "
                         "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64) "
-                        "или путь к файлу тестового репозитория")
+                        "или путь к файлу тестового репозитория (с --test-mode)")
     p.add_argument("--test-mode", action="store_true",
                    help="режим работы с тестовым репозиторием")
     p.add_argument("--output", default="graph.png",
@@ -42,7 +42,8 @@ def build_parser():
     p.add_argument("--max-depth", type=non_negative_int, default=3,
                    help="максимальная глубина анализа (по умолчанию 3)")
     p.add_argument("--filter", default="",
-                   help="подстрока для фильтрации пакетов")
+                   help="пакеты, в имени которых есть эта подстрока, "
+                        "не учитываются")
     return p
 
 
@@ -55,42 +56,33 @@ def format_config(cfg):
 
 
 
-def load_apkindex_text(repo, test_mode):
+def load_apkindex_text(repo):
     if not repo:
         raise ValueError("не задан --repo")
+    if not repo.startswith(("http://", "https://")):
+        raise ValueError("--repo должен быть URL (http/https); "
+                         "для файла используйте --test-mode")
+    url = repo.rstrip("/")
+    if not url.endswith("APKINDEX.tar.gz"):
+        url += "/APKINDEX.tar.gz"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"HTTP {e.code} при загрузке {url}")
+    except urllib.error.URLError as e:
+        raise ValueError(f"не удалось загрузить {url}: {e.reason}")
 
-    if test_mode or os.path.exists(repo):
-        if not os.path.isfile(repo):
-            raise ValueError(f"файл тестового репозитория не найден: {repo}")
-        with open(repo, "rb") as f:
-            data = f.read()
-    else:
-        if not repo.startswith(("http://", "https://")):
-            raise ValueError("--repo должен быть URL (http/https) "
-                             "или путём к файлу в тестовом режиме")
-        url = repo.rstrip("/")
-        if not url.endswith("APKINDEX.tar.gz"):
-            url += "/APKINDEX.tar.gz"
-        try:
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                data = resp.read()
-        except urllib.error.HTTPError as e:
-            raise ValueError(f"HTTP {e.code} при загрузке {url}")
-        except urllib.error.URLError as e:
-            raise ValueError(f"не удалось загрузить {url}: {e.reason}")
-
-    if data[:2] == b"\x1f\x8b":
-        try:
-            raw = gzip.decompress(data)
-            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
-                member = next((m for m in tar.getmembers()
-                               if m.name == "APKINDEX"), None)
-                if member is None:
-                    raise ValueError("в архиве нет файла APKINDEX")
-                data = tar.extractfile(member).read()
-        except (OSError, tarfile.TarError, EOFError) as e:
-            raise ValueError(f"не удалось распаковать APKINDEX: {e}")
-
+    try:
+        raw = gzip.decompress(data)
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
+            member = next((m for m in tar.getmembers()
+                           if m.name == "APKINDEX"), None)
+            if member is None:
+                raise ValueError("в архиве нет файла APKINDEX")
+            data = tar.extractfile(member).read()
+    except (OSError, tarfile.TarError, EOFError) as e:
+        raise ValueError(f"не удалось распаковать APKINDEX: {e}")
     return data.decode("utf-8", errors="replace")
 
 
@@ -106,23 +98,189 @@ def parse_apkindex(text):
     return packages
 
 
-def find_package(packages, name):
-    for pkg in packages:
-        if pkg["P"] == name:
-            return pkg
-    for pkg in packages:
-        for provided in pkg.get("p", "").split():
-            if provided.split("=")[0] == name:
-                return pkg
-    return None
+def base_name(token):
+    for i, ch in enumerate(token):
+        if ch in "<>=~":
+            return token[:i]
+    return token
 
 
-def get_direct_dependencies(package, repo, test_mode):
-    packages = parse_apkindex(load_apkindex_text(repo, test_mode))
-    pkg = find_package(packages, package)
-    if pkg is None:
-        raise ValueError(f"пакет '{package}' не найден в репозитории")
-    return pkg, pkg.get("D", "").split()
+def load_apk_deps(repo):
+    packages = parse_apkindex(load_apkindex_text(repo))
+    by_name = {}
+    for pkg in packages:
+        by_name.setdefault(pkg["P"], pkg)
+
+    provides = {}
+    for pkg in packages:
+        for token in pkg.get("p", "").split():
+            provides.setdefault(base_name(token), pkg["P"])
+
+    def resolve(token):
+        name = base_name(token)
+        if name in by_name:
+            return name
+        return provides.get(name, name)
+
+    deps = {}
+    for name, pkg in by_name.items():
+        result = []
+        for token in pkg.get("D", "").split():
+            if token.startswith("!"):
+                continue
+            dep = resolve(token)
+            if dep != name and dep not in result:
+                result.append(dep)
+        deps[name] = result
+    return deps
+
+
+
+
+NAME_RE = re.compile(r"^[A-Z]+$")
+
+
+def load_test_deps(path):
+    if not path:
+        raise ValueError("не задан путь к файлу тестового репозитория (--repo)")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise ValueError(f"не удалось открыть файл {path}: {e}")
+
+    deps = {}
+    for num, line in enumerate(lines, 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise ValueError(f"строка {num}: ожидается формат 'A: B C'")
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        items = rest.replace(",", " ").split()
+        for n in [name] + items:
+            if not NAME_RE.match(n):
+                raise ValueError(f"строка {num}: имя пакета '{n}' должно "
+                                 f"состоять из заглавных латинских букв")
+        deps.setdefault(name, [])
+        for d in items:
+            if d not in deps[name]:
+                deps[name].append(d)
+    return deps
+
+
+
+def build_graph(root, deps_map, max_depth, substr):
+    def expand(node):
+        return [d for d in deps_map.get(node, [])
+                if not (substr and substr in d)]
+
+    order = [root]
+    graph = {}
+    cycles = []
+    best = {root: 0}
+    on_path = set()
+    stack = []
+
+    if max_depth > 0:
+        graph[root] = expand(root)
+        stack.append((root, 0, iter(graph[root])))
+        on_path.add(root)
+
+    while stack:
+        node, depth, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            stack.pop()
+            on_path.discard(node)
+            continue
+
+        if child in on_path:
+            path = [frame[0] for frame in stack]
+            cycle = path[path.index(child):] + [child]
+            if cycle not in cycles:
+                cycles.append(cycle)
+            continue
+
+        d = depth + 1
+        if child in best and best[child] <= d:
+            continue
+        if child not in best:
+            order.append(child)
+        best[child] = d
+
+        if d < max_depth:
+            graph[child] = expand(child)
+            stack.append((child, d, iter(graph[child])))
+            on_path.add(child)
+
+    return order, graph, cycles
+
+
+def ascii_tree(root, graph):
+    lines = [root]
+    stack = []
+
+    def push_children(node, prefix, path):
+        kids = graph.get(node, [])
+        for i in range(len(kids) - 1, -1, -1):
+            stack.append((kids[i], prefix, i == len(kids) - 1, path))
+
+    push_children(root, "", (root,))
+    while stack:
+        node, prefix, last, path = stack.pop()
+        connector = "└── " if last else "├── "
+        if node in path:
+            lines.append(f"{prefix}{connector}{node} (цикл)")
+            continue
+        lines.append(f"{prefix}{connector}{node}")
+        push_children(node, prefix + ("    " if last else "│   "),
+                      path + (node,))
+    return lines
+
+
+def analyze(cfg):
+    package, substr = cfg["package"], cfg["filter"]
+    if substr and substr in package:
+        raise ValueError(f"пакет '{package}' исключён фильтром '{substr}'")
+
+    if cfg["test_mode"]:
+        deps_map = load_test_deps(cfg["repo"])
+        if package not in deps_map:
+            raise ValueError(f"пакет '{package}' не найден "
+                             f"в тестовом репозитории")
+    else:
+        deps_map = load_apk_deps(cfg["repo"])
+        if package not in deps_map:
+            raise ValueError(f"пакет '{package}' не найден в репозитории")
+
+    order, graph, cycles = build_graph(package, deps_map,
+                                       cfg["max_depth"], substr)
+
+    out = [f"Граф зависимостей пакета {package} "
+           f"(макс. глубина: {cfg['max_depth']}, "
+           f"фильтр: {substr or 'нет'}):"]
+    for node in order:
+        if node not in graph:
+            out.append(f"  {node} -> … (не раскрыт: предел глубины)")
+        elif graph[node]:
+            out.append(f"  {node} -> {', '.join(graph[node])}")
+        else:
+            out.append(f"  {node} -> (нет зависимостей)")
+    out.append(f"Всего вершин: {len(order)}")
+
+    if cycles:
+        out.append("Циклические зависимости:")
+        out += [f"  {' -> '.join(c)}" for c in cycles]
+    else:
+        out.append("Циклических зависимостей не найдено.")
+
+    if cfg["ascii_tree"]:
+        out.append("")
+        out.append("ASCII-дерево:")
+        out += ascii_tree(package, graph)
+    return "\n".join(out)
 
 
 
@@ -168,27 +326,15 @@ def handle(args):
     text = format_config(config)
     print(text)
     write(text)
-
-
     write("")
-    write("Загрузка данных репозитория...")
-    window.update_idletasks()
+
     try:
-        pkg, deps = get_direct_dependencies(
-            config["package"], config["repo"], config["test_mode"])
+        result = analyze(config)
     except ValueError as e:
         write(f"Ошибка: {e}")
         return
-
-    header = f"Прямые зависимости пакета {pkg['P']} {pkg.get('V', '')}:"
-    lines = [header]
-    if deps:
-        lines += [f"  {i}. {d}" for i, d in enumerate(deps, 1)]
-    else:
-        lines.append("  (нет зависимостей)")
-    out = "\n".join(lines)
-    print(out)
-    write(out)
+    print(result)
+    write(result)
 
 
 def on_enter(event):
@@ -231,8 +377,9 @@ console.bind("<Home>", on_home)
 if len(sys.argv) > 1:
     handle(sys.argv[1:])
 else:
-    write("Введите опции, например: --package busybox "
+    write("Пример: --package busybox "
           "--repo https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64")
+    write("Тест:   --package A --repo test1.txt --test-mode")
     write("help — список опций, exit — выход")
 show_prompt()
 window.mainloop()
