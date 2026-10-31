@@ -44,6 +44,9 @@ def build_parser():
     p.add_argument("--filter", default="",
                    help="пакеты, в имени которых есть эта подстрока, "
                         "не учитываются")
+    p.add_argument("--load-order", action="store_true",
+                   help="вывести порядок загрузки зависимостей "
+                        "(зависимости раньше зависимых пакетов)")
     return p
 
 
@@ -239,6 +242,22 @@ def ascii_tree(root, graph):
                       path + (node,))
     return lines
 
+def load_order(root, graph):
+    result = []
+    visited = {root}
+    stack = [(root, iter(graph.get(root, [])))]
+    while stack:
+        node, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            stack.pop()
+            result.append(node)
+            continue
+        if child in visited:
+            continue
+        visited.add(child)
+        stack.append((child, iter(graph.get(child, []))))
+    return result
 
 def analyze(cfg):
     package, substr = cfg["package"], cfg["filter"]
@@ -275,6 +294,12 @@ def analyze(cfg):
         out += [f"  {' -> '.join(c)}" for c in cycles]
     else:
         out.append("Циклических зависимостей не найдено.")
+
+    if cfg["load_order"]:
+        out.append("")
+        out.append("Порядок загрузки (зависимости раньше зависимых):")
+        for i, name in enumerate(load_order(package, graph), 1):
+            out.append(f"  {i}. {name}")
 
     if cfg["ascii_tree"]:
         out.append("")
