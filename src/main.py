@@ -499,7 +499,6 @@ class ConsoleApp:
 
 
 def main():
-    """Точка входа."""
     ConsoleApp().run(sys.argv[1:])
 
 
